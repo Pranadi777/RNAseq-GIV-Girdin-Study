@@ -1,0 +1,209 @@
+#-------------------------------------------------------------------------------------
+# script for analysis and generating figure.
+#-------------------------------------------------------------------------------------
+library(DESeq2)
+library(tidyverse)
+library(RColorBrewer)
+library(pheatmap)
+library(tximeta)
+library(vsn)
+library(biomaRt)
+library(tximport)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(EnhancedVolcano)
+#-------------------------------------------------------------------------------------
+# Making the coldata metadata dataframe for tximeta
+#-------------------------------------------------------------------------------------
+files <- c('quants/RAW_shC_LPS_5hr_S2/quant.sf',
+           'quants/RAW_sh2_GIV_LPS_5hr_S6/quant.sf',
+           'quants/RAW_sh1_GIV_LPS_5hr_S4/quant.sf')
+names <- c('shc','sh2','sh1')
+condition <- c('control','sh','sh')
+metadata <- data.frame(condition = condition, row.names = names)
+file.exists(files) #make sure the files exists
+
+
+#-------------------------------------------------------------------------------------
+# wirking with tximport
+#-------------------------------------------------------------------------------------
+txdb <- makeTxDbFromGFF("annotations/gencode.vM24.annotation.gff3")
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene)
+
+
+
+#-------------------------------------------------------------------------------------
+# Making the DESeq2 object from the tximeta object
+#-------------------------------------------------------------------------------------
+dds <- DESeqDataSetFromTximport(txi, colData = metadata, design= ~ condition)
+dds <- estimateSizeFactors(dds)
+#-------------------------------------------------------------------------------------
+# explore Data
+#-------------------------------------------------------------------------------------
+vsd <- vst(dds, blind = TRUE)
+vsd_mat <- assay(vsd)
+vsd_cor <- cor(vsd_mat)
+pheatmap(vsd_cor)
+
+#-------------------------------------------------------------------------------------
+#  Plot PCA
+#-------------------------------------------------------------------------------------
+plotPCA(vsd, intgroup = "condition")
+
+#-------------------------------------------------------------------------------------
+#  DE analysis
+#-------------------------------------------------------------------------------------
+dds <- DESeqDataSetFromTximport(txi, colData = metadata, design= ~ condition)
+dds <- DESeq(dds)
+
+#-------------------------------------------------------------------------------------
+#  getting normalized count matrix from DESeq2
+#-------------------------------------------------------------------------------------
+
+head(counts(dds, normalized = FALSE))
+head(counts(dds, normalized = TRUE))
+normalized_counts <- as.data.frame(counts(dds, normalized = TRUE))
+# need to rename the sample names
+#col 1 : c
+names(normalized_counts)[1] <- "RAW_shC_LPS_5hr_S2_L008_R1_001"
+#col 2 : sh2
+names(normalized_counts)[2] <- "RAW_sh2_GIV_LPS_5hr_S6_L008_R1_001"
+#col 3 : sh1
+names(normalized_counts)[3] <- "RAW_sh1_GIV_LPS_5hr_S4_L008_R1_001"
+
+write.table(normalized_counts,
+            'submitting_to_geo/normallized_counts.txt',
+            sep="\t",
+            row.names=TRUE,
+            quote=FALSE,
+            col.names=NA)
+
+?write.table
+?counts
+?DESeq
+#-------------------------------------------------------------------------------------
+#  plot dispersion
+#-------------------------------------------------------------------------------------
+plotDispEsts(dds)
+
+#-------------------------------------------------------------------------------------
+#  return DE results and shrink log fold changes
+#-------------------------------------------------------------------------------------
+res <-results(dds,
+              contrast = c('condition','sh','control'),
+              alpha = 0.05)
+
+res <- lfcShrink(dds,
+                 contrast = c('condition','sh','control'),
+                 res=res)
+
+#-------------------------------------------------------------------------------------
+#  Plot MA
+#-------------------------------------------------------------------------------------
+plotMA(res, ylim= c(-5,5))
+
+#-------------------------------------------------------------------------------------
+#  Summary of results
+#-------------------------------------------------------------------------------------
+summary(res)
+res
+
+#-------------------------------------------------------------------------------------
+#  exporting results
+#-------------------------------------------------------------------------------------
+
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL")
+ensembl = useDataset("mmusculus_gene_ensembl", mart = ensembl)
+
+res_all <- data.frame(res)
+res_all['ensembl_gene_id_version'] <- rownames(res_all)
+
+res_ensembl <- getBM(attributes = c( 
+  'ensembl_gene_id',
+  'ensembl_gene_id_version',
+  'external_gene_name'),
+  filters = 'ensembl_gene_id_version', 
+  values = rownames(res_all),
+  mart = ensembl)
+
+res_all  <- left_join(x = res_all,
+                      y = res_ensembl,
+                      by = c("ensembl_gene_id_version" = "ensembl_gene_id_version"),
+                      copy = TRUE)
+
+res_sig <- subset(res_all, padj <0.05)
+res_sig <- res_sig %>%
+  arrange(padj)
+
+
+#-------------------------------------------------------------------------------------
+# plotting counts of significant genes
+#-------------------------------------------------------------------------------------
+normalized_counts <- counts(dds,normalized=TRUE)
+sig_norm_counts <- normalized_counts[res_sig$ensembl_gene_id_version,]
+
+heat_colors <- rev(brewer.pal(6, "RdBu"))
+pheatmap(sig_norm_counts,
+         color= heat_colors,
+         cluster_rows = T,
+         show_rownames = F,
+         scale = "row")
+
+#-------------------------------------------------------------------------------------
+# volcanoe plot
+#-------------------------------------------------------------------------------------
+res_all <- res_all %>%
+  mutate(threshold = padj < 0.05)
+
+
+ggplot(res_all) +
+  geom_point(aes(x=log2FoldChange,
+                 y=-log10(padj),
+                 color=threshold)) +
+  #the above code is enough to plot the  volcano  plot
+  xlab("log2 fold change") +
+  ylab("-log10 adjusted p value") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust=0.5),
+        axis.title = element_text(size=rel(1.25)))
+
+write.csv(res_all, 'results/all_results_fastq2DE.csv')
+write.csv(res_sig, 'results/sig_results_fastq2DE.csv')
+
+#-------------------------------------------------------------------------------------
+# Enhanced volcanoe plot
+#-------------------------------------------------------------------------------------
+res_vol <- res_all
+res_vol <- res_vol[!duplicated(res_vol$external_gene_name),]
+rownames(res_vol) <- res_vol[,9]
+  
+EnhancedVolcano(res_vol,
+                lab = rownames(res_vol),
+                selectLab = c("Il6","Il1b",
+                              "Il1a","IL23A",
+                              "Cxcl2","Ifnb1",
+                              "Irf3","Cd86",
+                              "Batf3","Batf2",
+                              "Stat3"),
+                x = 'log2FoldChange',
+                ylim = c(0,20),
+                FCcutoff = 1,
+                pCutoff = 0.05,
+                drawConnectors = TRUE,
+                widthConnectors = 0.8,
+                lengthConnectors = unit(0.01, 'npc'),
+                labFace = 'bold',
+                labSize = 5.0,
+                boxedLabels = TRUE,
+                y = 'padj',
+                xlim = c(-3.5, 3.5))
+
+?EnhancedVolcano
+sessionInfo()
+
+
+
+
+
+
